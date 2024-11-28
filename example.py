@@ -1,74 +1,146 @@
-# Sparsely-Gated Mixture-of-Experts Layers.
-# See "Outrageously Large Neural Networks"
-# https://arxiv.org/abs/1701.06538
-#
-# Author: David Rau
-#
-
 import torch
 from torch import nn
 from torch.optim import Adam
+from torch.utils.data import TensorDataset, DataLoader
+from tqdm import tqdm  # Import tqdm for progress bar
 
-from moe import MoE
-
-
-def train(x, y, model, loss_fn, optim):
-    # model returns the prediction and the loss that encourages all experts to have equal importance and load
-    y_hat, aux_loss = model(x.float())
-    # calculate prediction loss
-    loss = loss_fn(y_hat, y)
-    # combine losses
-    total_loss = loss + aux_loss
-    optim.zero_grad()
-    total_loss.backward()
-    optim.step()
-
-    print("Training Results - loss: {:.2f}, aux_loss: {:.3f}".format(loss.item(), aux_loss.item()))
-    return model
+from model import LanguageModel  # Import the complete model
 
 
-def eval(x, y, model, loss_fn):
-    model.eval()
-    # model returns the prediction and the loss that encourages all experts to have equal importance and load
-    y_hat, aux_loss = model(x.float())
-    loss = loss_fn(y_hat, y)
-    total_loss = loss + aux_loss
-    print("Evaluation Results - loss: {:.2f}, aux_loss: {:.3f}".format(loss.item(), aux_loss.item()))
+def generate_random_data(num_samples, seq_len, input_dim, output_dim):
+    """
+    Generate random sequences of input vectors and corresponding target sequences.
 
+    Args:
+        num_samples (int): Number of samples to generate.
+        seq_len (int): Sequence length.
+        input_dim (int): Dimension of the input vectors.
+        output_dim (int): Dimension of the output vectors.
 
-def dummy_data(batch_size, input_size, num_classes):
-    # dummy input
-    x = torch.rand(batch_size, input_size)
-
-    # dummy target
-    y = torch.randint(num_classes, (batch_size, 1)).squeeze(1)
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Input and target sequences.
+    """
+    x = torch.rand(num_samples, seq_len, input_dim)
+    y = torch.randint(0, output_dim, (num_samples, seq_len))
     return x, y
 
 
-# arguments
-input_size = 1000
-num_classes = 20
-num_experts = 10
-hidden_size = 64
-batch_size = 5
-k = 4
+def train_model(model, loss_fn, optimizer, x_train, y_train, x_val, y_val, epochs, batch_size, device):
+    """
+    Train the model on the training data and evaluate on validation data.
 
-# determine device
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
+    Args:
+        model (nn.Module): The model to train.
+        loss_fn (nn.Module): Loss function.
+        optimizer (Optimizer): Optimizer for training.
+        x_train (Tensor): Training inputs.
+        y_train (Tensor): Training targets.
+        x_val (Tensor): Validation inputs.
+        y_val (Tensor): Validation targets.
+        epochs (int): Number of training epochs.
+        batch_size (int): Batch size for training and validation.
+    """
+    # Prepare data loaders
+    train_dataset = TensorDataset(x_train, y_train)
+    val_dataset = TensorDataset(x_val, y_val)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    print("Data loaders created and starting training")
+    for epoch in range(epochs):
+        print(f"Starting with {epoch+1}/{epochs}")
+        model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        for x_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            optimizer.zero_grad()
+            logits, aux_loss = model(x_batch)
+            # Reshape for loss computation
+            logits = logits.view(-1, logits.size(-1))
+            y_batch = y_batch.view(-1)
+            loss = loss_fn(logits, y_batch)
+            total_loss = loss + aux_loss
+            total_loss.backward()
+            optimizer.step()
 
-# instantiate the MoE layer
-model = MoE(input_size, num_classes, num_experts, hidden_size, k=k, noisy_gating=True)
-model = model.to(device)
-loss_fn = nn.CrossEntropyLoss()
-optim = Adam(model.parameters())
+            # Calculate training accuracy
+            preds = logits.argmax(dim=-1)
+            correct += (preds == y_batch).sum().item()
+            total += y_batch.size(0)
 
-x, y = dummy_data(batch_size, input_size, num_classes)
+        avg_train_loss = total_loss.item() / len(train_loader)
+        train_accuracy = correct / total
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
 
-# train
-model = train(x.to(device), y.to(device), model, loss_fn, optim)
-# evaluate
-x, y = dummy_data(batch_size, input_size, num_classes)
-eval(x.to(device), y.to(device), model, loss_fn)
+        # Validation
+        model.eval()
+        total_val_loss = 0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x_batch, y_batch in val_loader:
+                x_batch = x_batch.to(device)
+                y_batch = y_batch.to(device)
+                logits, _ = model(x_batch)
+                logits = logits.view(-1, logits.size(-1))
+                y_batch = y_batch.view(-1)
+                val_loss = loss_fn(logits, y_batch)
+                total_val_loss += val_loss.item()
+                preds = logits.argmax(dim=-1)
+                correct += (preds == y_batch).sum().item()
+                total += y_batch.size(0)
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_accuracy = correct / total
+        print(f"Epoch {epoch+1}/{epochs}, Val Loss: {avg_val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
+
+
+def main():
+    """
+    Main function to set up data, model, and start training.
+    """
+    # Hyperparameters
+    input_dim = 1457
+    hidden_dim = 512
+    output_dim = 10
+    num_experts = 10
+    seq_len = 2
+    batch_size = 64
+    k = 2
+    epochs = 5  # Adjust as needed
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("Using device:", device)
+
+    # Generate random data
+    num_samples = 10000
+    x_data, y_data = generate_random_data(num_samples, seq_len, input_dim, output_dim)
+
+    # Split data into training and validation sets
+    split_idx = int(0.8 * num_samples)
+    x_train, x_val = x_data[:split_idx], x_data[split_idx:]
+    y_train, y_val = y_data[:split_idx], y_data[split_idx:]
+
+    # Instantiate the LanguageModel
+    model = LanguageModel(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim,
+                          num_experts=num_experts, k=k)
+    model = model.to(device)
+    print(f"Model created {model}")
+
+    # Loss function and optimizer
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = Adam(model.parameters())
+
+    # Move data to device
+    x_train = x_train.to(device)
+    y_train = y_train.to(device)
+    x_val = x_val.to(device)
+    y_val = y_val.to(device)
+    print("Data moved to device")
+    # Train the model
+    train_model(model, loss_fn, optimizer, x_train, y_train, x_val, y_val, epochs, batch_size, device)
+
+
+if __name__ == '__main__':
+    main()

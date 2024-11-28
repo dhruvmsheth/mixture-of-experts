@@ -111,35 +111,10 @@ class SparseDispatcher(object):
         # split nonzero gates for each expert
         return torch.split(self._nonzero_gates, self._part_sizes, dim=0)
 
-class MLP(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, output_size)
-        self.relu = nn.ReLU()
-        self.soft = nn.Softmax(1)
-
-    def forward(self, x):
-        out = self.fc1(x)
-        out = self.relu(out)
-        out = self.fc2(out)
-        out = self.soft(out)
-        return out
-
-
 class MoE(nn.Module):
+    """Sparsely-Gated Mixture-of-Experts Layer"""
 
-    """Call a Sparsely gated mixture of experts layer with 1-layer Feed-Forward networks as experts.
-    Args:
-    input_size: integer - size of the input
-    output_size: integer - size of the input
-    num_experts: an integer - number of experts
-    hidden_size: an integer - hidden size of the experts
-    noisy_gating: a boolean
-    k: an integer - how many experts to use for each batch element
-    """
-
-    def __init__(self, input_size, output_size, num_experts, hidden_size, noisy_gating=True, k=4):
+    def __init__(self, input_size, output_size, num_experts, hidden_size=1024, noisy_gating=True, k=4):
         super(MoE, self).__init__()
         self.noisy_gating = noisy_gating
         self.num_experts = num_experts
@@ -147,16 +122,20 @@ class MoE(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.k = k
-        # instantiate experts
-        self.experts = nn.ModuleList([MLP(self.input_size, self.output_size, self.hidden_size) for i in range(self.num_experts)])
-        self.w_gate = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
-        self.w_noise = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
+        # Instantiate experts with one hidden layer of size hidden_size
+        self.experts = nn.ModuleList([nn.Sequential(
+            nn.Linear(self.input_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.output_size)
+        ) for _ in range(self.num_experts)])
+        self.w_gate = nn.Parameter(torch.zeros(self.input_size, self.num_experts))
+        self.w_noise = nn.Parameter(torch.zeros(self.input_size, self.num_experts))
 
         self.softplus = nn.Softplus()
-        self.softmax = nn.Softmax(1)
-        self.register_buffer("mean", torch.tensor([0.0]))
-        self.register_buffer("std", torch.tensor([1.0]))
-        assert(self.k <= self.num_experts)
+        self.softmax = nn.Softmax(dim=1)
+        self.register_buffer("mean", torch.tensor(0.0))
+        self.register_buffer("std", torch.tensor(1.0))
+        assert self.k <= self.num_experts
 
     def cv_squared(self, x):
         """The squared coefficient of variation of a sample.
@@ -275,7 +254,6 @@ class MoE(nn.Module):
 
         dispatcher = SparseDispatcher(self.num_experts, gates)
         expert_inputs = dispatcher.dispatch(x)
-        gates = dispatcher.expert_to_gates()
         expert_outputs = [self.experts[i](expert_inputs[i]) for i in range(self.num_experts)]
         y = dispatcher.combine(expert_outputs)
         return y, loss
