@@ -1,84 +1,126 @@
-# This file is based on the `https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html`.
-
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim import Adam
+from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
+from tqdm import tqdm
 
-from moe import MoE
-
-transform = transforms.Compose(
-    [transforms.ToTensor(),
-     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
-trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                        download=True, transform=transform)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=64,
-                                          shuffle=True, num_workers=2)
-
-testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                       download=True, transform=transform)
-testloader = torch.utils.data.DataLoader(testset, batch_size=64,
-                                         shuffle=False, num_workers=2)
-
-classes = ('plane', 'car', 'bird', 'cat',
-           'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+from model import LanguageModel  # Use the same model as in example.py
 
 
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
+def train_model(model, loss_fn, optimizer, train_loader, val_loader, epochs, device):
+    """
+    Train the model on the training data and evaluate on validation data.
+    """
+    for epoch in range(epochs):
+        print(f"Starting with {epoch+1}/{epochs}")
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        for x_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
 
-net = MoE(input_size=3072, output_size=10, num_experts=10, hidden_size=128, noisy_gating=True, k=4)
-net = net.to(device)
+            optimizer.zero_grad()
+            logits, aux_loss = model(x_batch)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), y_batch.view(-1)) + aux_loss
+            loss.backward()
+            optimizer.step()
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(net.parameters(), lr=0.001)
+            # Accumulate training loss
+            running_loss += loss.item() * x_batch.size(0)
 
-net.train()
-for epoch in range(1):  # loop over the dataset multiple times
+            # Calculate training accuracy
+            preds = logits.argmax(dim=-1)
+            correct += (preds == y_batch).sum().item()
+            total += y_batch.size(0)
 
-    running_loss = 0.0
-    for i, data in enumerate(trainloader, 0):
-        # get the inputs; data is a list of [inputs, labels]
-        inputs, labels = data
-        inputs, labels = inputs.to(device), labels.to(device)
+        avg_train_loss = running_loss / total
+        train_accuracy = correct / total
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
 
-        # zero the parameter gradients
-        optimizer.zero_grad()
-
-        # forward + backward + optimize
-        inputs = inputs.view(inputs.shape[0], -1)
-        outputs, aux_loss = net(inputs)
-        loss = criterion(outputs, labels)
-        total_loss = loss + aux_loss
-        total_loss.backward()
-        optimizer.step()
-
-        # print statistics
-        running_loss += loss.item()
-        if i % 100 == 99:    # print every 2000 mini-batches
-            print('[%d, %5d] loss: %.3f' %
-                  (epoch + 1, i + 1, running_loss / 100))
-            running_loss = 0.0
-
-print('Finished Training')
+        # Validation
+        model.eval()
+        total_val_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x_batch, y_batch in val_loader:
+                x_batch = x_batch.to(device)
+                y_batch = y_batch.to(device)
+                logits, aux_loss = model(x_batch)
+                val_loss = loss_fn(logits.view(-1, logits.size(-1)), y_batch.view(-1)) + aux_loss
+                total_val_loss += val_loss.item() * x_batch.size(0)
+                preds = logits.argmax(dim=-1)
+                correct += (preds == y_batch).sum().item()
+                total += y_batch.size(0)
+        avg_val_loss = total_val_loss / total
+        val_accuracy = correct / total
+        print(f"Epoch {epoch+1}/{epochs}, Val Loss: {avg_val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
 
 
-correct = 0
-total = 0
-net.eval()
-with torch.no_grad():
-    for data in testloader:
-        images, labels = data
-        images, labels = images.to(device), labels.to(device)
-        outputs, _ = net(images.view(images.shape[0], -1))
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
+def inspect_experts(model):
+    """
+    Inspect the experts in the MoE layer after training.
+    """
+    moe_layer = model.moe
+    for idx, expert in enumerate(moe_layer.experts):
+        print(f"Expert {idx} parameters:")
+        for name, param in expert.named_parameters():
+            print(f"  {name}: mean={param.data.mean():.4f}, std={param.data.std():.4f}")
 
-print('Accuracy of the network on the 10000 test images: %d %%' % (
-    100 * correct / total))
+
+def main():
+    """
+    Main function to set up data, model, and start training.
+    """
+    # Hyperparameters
+    input_dim = 3 * 32 * 32  # CIFAR-10 images are 32x32 RGB images
+    hidden_dim = 512
+    output_dim = 10  # CIFAR-10 has 10 classes
+    num_experts = 10
+    batch_size = 64
+    k = 4
+    epochs = 5  # Adjust as needed
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("Using device:", device)
+
+    # Data transformations
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+
+    # Prepare CIFAR-10 dataset
+    train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                                 download=True, transform=transform)
+    val_dataset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                               download=True, transform=transform)
+
+    # Data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Instantiate the LanguageModel
+    model = LanguageModel(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim,
+                          num_experts=num_experts, k=k)
+    model = model.to(device)
+    print(f"Model created {model}")
+
+    # Loss function and optimizer
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = Adam(model.parameters())
+
+    # Train the model
+    train_model(model, loss_fn, optimizer, train_loader, val_loader, epochs, device)
+
+    # Inspect the experts after training
+    inspect_experts(model)
+
+
+if __name__ == '__main__':
+    main()
 

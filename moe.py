@@ -256,4 +256,6 @@ class MoE(nn.Module):
         expert_inputs = dispatcher.dispatch(x)
         expert_outputs = [self.experts[i](expert_inputs[i]) for i in range(self.num_experts)]
         y = dispatcher.combine(expert_outputs)
+        # Store gates for analysis
+        self.last_gates = gates.detach()
         return y, loss

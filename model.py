@@ -13,6 +13,11 @@ class LanguageModel(nn.Module):
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
+        # x is of shape (batch_size, channels, height, width)
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1)  # Flatten the images
+        x = x.unsqueeze(1)  # Add sequence length dimension
+        
         # Embedding layer
         embed = self.embedding(x)
         # First LSTM layer
@@ -21,11 +26,11 @@ class LanguageModel(nn.Module):
 
         # Reshape for MoE layer
         batch_size, seq_len, hidden_dim = out.size()
-        out_reshaped = out.reshape(-1, hidden_dim)  # Use reshape instead of view
+        out_reshaped = out.reshape(-1, hidden_dim)
 
         # MoE layer
         moe_out_reshaped, aux_loss = self.moe(out_reshaped)
-        moe_out = moe_out_reshaped.reshape(batch_size, seq_len, hidden_dim)  # Reshape back
+        moe_out = moe_out_reshaped.reshape(batch_size, seq_len, hidden_dim)
         moe_out = torch.sigmoid(moe_out)
         moe_out = self.dropout(moe_out)
         moe_out = moe_out + out  # Residual connection
@@ -37,5 +42,4 @@ class LanguageModel(nn.Module):
         # Output layer
         out = self.dropout(out)
         logits = self.fc(out)
-        # Return logits and auxiliary loss from MoE
         return logits, aux_loss
